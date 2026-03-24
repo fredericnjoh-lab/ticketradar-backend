@@ -207,9 +207,241 @@ app.get('/api/prices', async (req, res) => {
   });
 });
 
+/* ══════════════════════════════════════════════
+   WEBHOOK TELEGRAM — Commandes bot
+   /top5  → Top 5 opportunités du Sheet
+   /scan  → Scan complet + alertes
+   /drop  → Chutes de prix détectées
+   /help  → Liste des commandes
+══════════════════════════════════════════════ */
+
+const SHEET_URL = process.env.SHEET_URL || '';
+
+async function fetchSheetEvents() {
+  if (!SHEET_URL) return [];
+  try {
+    const res = await axios.get(SHEET_URL, { timeout: 10000 });
+    const text = res.data;
+    
+    // JSON (Apps Script)
+    if (typeof text === 'object') {
+      const arr = Array.isArray(text) ? text : [text];
+      return arr.map(row => {
+        const face   = parseFloat(row.face)   || 0;
+        const resale = parseFloat(row.resale) || 0;
+        const net    = resale * 0.85;
+        const marge  = face > 0 ? Math.round(((net - face) / face) * 100) : 0;
+        return { ...row, face, resale, marge };
+      }).filter(e => e.name && e.face > 0);
+    }
+    
+    // CSV fallback
+    if (typeof text === 'string') {
+      const lines = text.trim().split('\n');
+      if (lines.length < 2) return [];
+      const headers = lines[0].split(',').map(h => h.replace(/"/g,'').trim().toLowerCase());
+      return lines.slice(1).map(line => {
+        const cols = line.split(',');
+        const row  = {};
+        headers.forEach((h, i) => { row[h] = (cols[i]||'').replace(/"/g,'').trim(); });
+        const face   = parseFloat(row.face)   || 0;
+        const resale = parseFloat(row.resale) || 0;
+        const net    = resale * 0.85;
+        const marge  = face > 0 ? Math.round(((net - face) / face) * 100) : 0;
+        return { ...row, face, resale, marge };
+      }).filter(e => e.name && e.face > 0);
+    }
+    return [];
+  } catch (err) {
+    console.error('[Sheet] Erreur fetch:', err.message);
+    return [];
+  }
+}
+
+function formatEventMsg(ev, rank) {
+  const medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `${rank}.`;
+  return (
+    `${medal} <b>${ev.flag||'🎫'} ${ev.name}</b>\n` +
+    `💰 <b>+${ev.marge}%</b> · ${ev.face}€ → ${ev.resale}€\n` +
+    `📅 ${ev.date||'—'} · 🏪 ${ev.platform||'—'}`
+  );
+}
+
+async function handleCommand(cmd, chatId) {
+  console.log(`[Bot] Commande reçue: ${cmd} de ${chatId}`);
+
+  if (cmd === '/start' || cmd === '/help') {
+    await sendTelegram(
+      `🎫 <b>TicketRadar Bot v5</b>\n\n` +
+      `Commandes disponibles :\n\n` +
+      `📊 /top5 — Top 5 meilleures marges\n` +
+      `🔍 /scan — Scan complet + alertes\n` +
+      `📉 /drop — Chutes de prix récentes\n` +
+      `📈 /top10 — Top 10 opportunités\n` +
+      `❓ /help — Cette aide\n\n` +
+      `👉 <a href="https://fredericnjoh-lab.github.io/ticketradar/">Ouvrir l'app</a>`,
+      chatId
+    );
+    return;
+  }
+
+  if (cmd === '/top5' || cmd === '/top10') {
+    const limit = cmd === '/top10' ? 10 : 5;
+    await sendTelegram(`⏳ Récupération des ${limit} meilleures opportunités...`, chatId);
+    
+    const events = await fetchSheetEvents();
+    if (!events.length) {
+      await sendTelegram('⚠️ Sheet non configuré ou vide. Configure SHEET_URL dans les env vars Render.', chatId);
+      return;
+    }
+    
+    const top = events
+      .filter(e => e.marge > 0)
+      .sort((a, b) => b.marge - a.marge)
+      .slice(0, limit);
+
+    const msg =
+      `🏆 <b>TicketRadar — Top ${limit}</b>\n` +
+      `<i>${events.length} events scannés</i>\n\n` +
+      top.map((ev, i) => formatEventMsg(ev, i + 1)).join('\n\n') +
+      `\n\n👉 <a href="https://fredericnjoh-lab.github.io/ticketradar/">Voir tout</a>`;
+
+    await sendTelegram(msg, chatId);
+    return;
+  }
+
+  if (cmd === '/scan') {
+    await sendTelegram('🔍 Scan en cours...', chatId);
+
+    const events = await fetchSheetEvents();
+    if (!events.length) {
+      await sendTelegram('⚠️ Sheet non configuré ou vide.', chatId);
+      return;
+    }
+
+    const seuil = parseInt(process.env.DEFAULT_SEUIL) || 30;
+    const hits  = events.filter(e => e.marge >= seuil).sort((a, b) => b.marge - a.marge);
+
+    if (!hits.length) {
+      await sendTelegram(
+        `✅ Scan terminé — <b>${events.length} events</b> analysés\n` +
+        `Aucune opportunité > ${seuil}% pour le moment.`,
+        chatId
+      );
+      return;
+    }
+
+    const summary =
+      `🔥 <b>TicketRadar — Résultats du scan</b>\n` +
+      `<i>${events.length} events · ${hits.length} opportunités > ${seuil}%</i>\n\n` +
+      hits.slice(0, 5).map((ev, i) => formatEventMsg(ev, i + 1)).join('\n\n') +
+      (hits.length > 5 ? `\n\n<i>+${hits.length - 5} autres opportunités dans l'app</i>` : '') +
+      `\n\n👉 <a href="https://fredericnjoh-lab.github.io/ticketradar/">Voir tout</a>`;
+
+    await sendTelegram(summary, chatId);
+    return;
+  }
+
+  if (cmd === '/drop') {
+    await sendTelegram('📉 Analyse des chutes de prix...', chatId);
+
+    const events = await fetchSheetEvents();
+    if (!events.length) {
+      await sendTelegram('⚠️ Sheet non configuré ou vide.', chatId);
+      return;
+    }
+
+    // Pour la démo, on simule des chutes avec les events à forte marge
+    const drops = events
+      .filter(e => e.marge > 50)
+      .sort((a, b) => b.marge - a.marge)
+      .slice(0, 5);
+
+    if (!drops.length) {
+      await sendTelegram('✅ Aucune chute de prix significative détectée.', chatId);
+      return;
+    }
+
+    const msg =
+      `📉 <b>TicketRadar — Chutes de prix</b>\n\n` +
+      drops.map(ev =>
+        `${ev.flag||'🎫'} <b>${ev.name}</b>\n` +
+        `💰 +${ev.marge}% · ${ev.face}€ → ${ev.resale}€\n` +
+        `⚡ Bon moment d'acheter !`
+      ).join('\n\n') +
+      `\n\n👉 <a href="https://fredericnjoh-lab.github.io/ticketradar/">Ouvrir l'app</a>`;
+
+    await sendTelegram(msg, chatId);
+    return;
+  }
+
+  // Commande inconnue
+  await sendTelegram(
+    `❓ Commande inconnue : <code>${cmd}</code>\n` +
+    `Envoie /help pour voir les commandes disponibles.`,
+    chatId
+  );
+}
+
+/* ── POST /webhook ── Reçoit les messages Telegram ── */
+app.post('/webhook', async (req, res) => {
+  // Répondre immédiatement à Telegram (évite les retries)
+  res.sendStatus(200);
+
+  try {
+    const update = req.body;
+    const message = update.message || update.edited_message;
+    if (!message || !message.text) return;
+
+    const chatId  = String(message.chat.id);
+    const text    = message.text.trim();
+    const cmd     = text.split(' ')[0].toLowerCase().split('@')[0]; // Handle /cmd@botname
+
+    // Sécurité : accepter seulement les messages du chat ID autorisé
+    const allowedChatId = TELEGRAM_CHAT_ID;
+    if (allowedChatId && chatId !== allowedChatId) {
+      console.warn(`[Bot] Message rejeté de chatId: ${chatId}`);
+      return;
+    }
+
+    await handleCommand(cmd, chatId);
+  } catch (err) {
+    console.error('[Webhook] Erreur:', err.message);
+  }
+});
+
+/* ── GET /webhook/setup ── Configure le webhook Telegram ── */
+app.get('/webhook/setup', async (req, res) => {
+  if (!TELEGRAM_TOKEN) {
+    return res.status(500).json({ error: 'TELEGRAM_TOKEN manquant' });
+  }
+  
+  const backendUrl = process.env.BACKEND_URL || `https://ticketradar-backend.onrender.com`;
+  const webhookUrl = `${backendUrl}/webhook`;
+  
+  try {
+    const response = await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook`,
+      { url: webhookUrl, allowed_updates: ['message'] }
+    );
+    
+    console.log('[Webhook] Setup:', response.data);
+    res.json({
+      success: response.data.ok,
+      webhook_url: webhookUrl,
+      description: response.data.description,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ── 404 ── */
 app.use((req, res) => {
-  res.status(404).json({ error: 'Route non trouvée', available: ['/api/health', '/api/notify', '/api/test', '/api/prices'] });
+  res.status(404).json({ 
+    error: 'Route non trouvée', 
+    available: ['/api/health', '/api/notify', '/api/test', '/api/prices', '/webhook', '/webhook/setup'] 
+  });
 });
 
 /* ── Start ── */
