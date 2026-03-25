@@ -110,8 +110,11 @@ function validateEvent(ev) {
 app.get('/api/health', (req, res) => {
   res.json({
     status:    'ok',
-    version:   '5.0',
-    telegram:  TELEGRAM_TOKEN ? 'configured' : 'missing',
+    version:   '5.1',
+    telegram:  TELEGRAM_TOKEN   ? 'configured' : 'missing',
+    sheet:     SHEET_URL        ? 'configured' : 'missing',
+    chat_id:   TELEGRAM_CHAT_ID ? 'configured' : 'missing',
+    sheet_url: SHEET_URL ? SHEET_URL.slice(0, 60) + '...' : 'not set',
     timestamp: new Date().toISOString(),
   });
 });
@@ -218,9 +221,20 @@ app.get('/api/prices', async (req, res) => {
 const SHEET_URL = process.env.SHEET_URL || '';
 
 async function fetchSheetEvents() {
-  if (!SHEET_URL) return [];
+  if (!SHEET_URL) {
+    console.log('[Sheet] SHEET_URL non configuré');
+    return [];
+  }
+  console.log('[Sheet] Fetching:', SHEET_URL.slice(0, 60));
   try {
-    const res = await axios.get(SHEET_URL, { timeout: 10000 });
+    const res = await axios.get(SHEET_URL, { 
+      timeout: 15000,
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; TicketRadar/5.0)',
+        'Accept': 'application/json, text/plain, */*',
+      }
+    });
     const text = res.data;
     
     // JSON (Apps Script)
