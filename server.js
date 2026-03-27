@@ -450,11 +450,152 @@ app.get('/webhook/setup', async (req, res) => {
   }
 });
 
+/* ══════════════════════════════════════════════
+   COUNTDOWN ALERTS — J-7, J-3, J-1
+══════════════════════════════════════════════ */
+
+function getDaysUntil(dateStr) {
+  if (!dateStr) return null;
+  // Handle various date formats: "5-7 juin 2026", "30 mars 2026", "2026-06-05"
+  const months = {
+    'jan':0,'fév':1,'feb':1,'mar':2,'avr':3,'apr':3,'mai':4,'may':4,
+    'jun':5,'juin':5,'jul':6,'juil':6,'aug':7,'aoû':7,'sep':8,'oct':9,
+    'nov':10,'déc':11,'dec':11
+  };
+  
+  // Try ISO format first
+  let date = new Date(dateStr);
+  if (!isNaN(date)) {
+    const today = new Date(); today.setHours(0,0,0,0);
+    return Math.round((date - today) / (1000*60*60*24));
+  }
+  
+  // Try French format "30 mars 2026" or "5-7 juin 2026"
+  const match = dateStr.match(/(\d+)(?:-\d+)?\s+([a-zéû]+)\s+(\d{4})/i);
+  if (match) {
+    const day   = parseInt(match[1]);
+    const month = months[match[2].toLowerCase().slice(0,3)];
+    const year  = parseInt(match[3]);
+    if (month !== undefined) {
+      date = new Date(year, month, day);
+      const today = new Date(); today.setHours(0,0,0,0);
+      return Math.round((date - today) / (1000*60*60*24));
+    }
+  }
+  return null;
+}
+
+async function sendCountdownAlerts(events, chatId) {
+  const ALERT_DAYS = [7, 3, 1];
+  let sent = 0;
+
+  for (const ev of events) {
+    if (!ev.name || !ev.date) continue;
+    const days = getDaysUntil(ev.date);
+    if (days === null || !ALERT_DAYS.includes(days)) continue;
+
+    const urgency = days === 1 ? '🚨' : days === 3 ? '⚡' : '📅';
+    const label   = days === 1 ? 'DEMAIN !' : `J-${days}`;
+    const msg =
+      `${urgency} <b>TicketRadar — Rappel ${label}</b>
+
+` +
+      `${ev.flag||'🎫'} <b>${ev.name}</b>
+` +
+      `📅 ${ev.date}
+` +
+      `💰 Marge actuelle : <b>+${ev.marge}%</b>
+` +
+      `🎫 ${ev.face}€ → ${ev.resale}€
+` +
+      `🏪 ${ev.platform||'—'}
+
+` +
+      (days === 1
+        ? `⚠️ <b>Dernier jour pour vendre !</b>
+`
+        : days === 3
+        ? `💡 Plus que ${days} jours — bon moment pour vendre.
+`
+        : `📊 Une semaine avant l'event — surveille les prix.
+`) +
+      `
+👉 <a href="https://fredericnjoh-lab.github.io/ticketradar/">Ouvrir TicketRadar</a>`;
+
+    const ok = await sendTelegram(msg, chatId);
+    if (ok) {
+      sent++;
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+  return sent;
+}
+
+/* ── POST /api/countdown ── */
+app.post('/api/countdown', async (req, res) => {
+  const { events = [], chatId } = req.body;
+  if (!Array.isArray(events)) return res.status(400).json({ error: 'events requis' });
+
+  const validEvents = events.filter(validateEvent);
+  const sent = await sendCountdownAlerts(validEvents, chatId);
+
+  // Also return which events have upcoming dates
+  const upcoming = validEvents.map(ev => ({
+    name: ev.name,
+    date: ev.date,
+    days: getDaysUntil(ev.date),
+    marge: ev.marge,
+  })).filter(e => e.days !== null && e.days >= 0 && e.days <= 30)
+    .sort((a, b) => a.days - b.days);
+
+  res.json({ sent, upcoming, timestamp: new Date().toISOString() });
+});
+
+/* ── GET /api/countdown/check ── Test countdown ── */
+app.get('/api/countdown/check', async (req, res) => {
+  const events = await fetchSheetEvents();
+  const upcoming = events.map(ev => ({
+    name: ev.name,
+    date: ev.date,
+    days: getDaysUntil(ev.date),
+    marge: ev.marge,
+    flag: ev.flag,
+  })).filter(e => e.days !== null && e.days >= 0 && e.days <= 30)
+    .sort((a, b) => a.days - b.days);
+
+  res.json({ total: events.length, upcoming, timestamp: new Date().toISOString() });
+});
+
+/* ── Scheduled countdown check (toutes les 24h) ── */
+function scheduleCountdownCheck() {
+  const MS_24H = 24 * 60 * 60 * 1000;
+  
+  async function runCheck() {
+    console.log('[Countdown] Check quotidien...');
+    try {
+      const events = await fetchSheetEvents();
+      if (!events.length) return;
+      const sent = await sendCountdownAlerts(events, TELEGRAM_CHAT_ID);
+      if (sent > 0) console.log(`[Countdown] ${sent} alertes J-X envoyées`);
+    } catch(err) {
+      console.error('[Countdown] Erreur:', err.message);
+    }
+  }
+
+  // Premier check après 5 secondes (au démarrage)
+  setTimeout(runCheck, 5000);
+  // Puis toutes les 24h
+  setInterval(runCheck, MS_24H);
+}
+
+// Démarrer le scheduler
+scheduleCountdownCheck();
+
 /* ── 404 ── */
 app.use((req, res) => {
   res.status(404).json({ 
     error: 'Route non trouvée', 
-    available: ['/api/health', '/api/notify', '/api/test', '/api/prices', '/webhook', '/webhook/setup'] 
+    available: ['/api/health', '/api/notify', '/api/test', '/api/prices', '/api/countdown', '/api/countdown/check', '/webhook', '/webhook/setup'] 
   });
 });
 
