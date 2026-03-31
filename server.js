@@ -38,6 +38,8 @@ if (!SEATGEEK_CLIENT_ID)   console.warn('⚠ SEATGEEK_CLIENT_ID manquant — /ap
 if (!TICKETMASTER_API_KEY) console.warn('⚠ TICKETMASTER_API_KEY manquant — /api/scan limité');
 
 /* ── Middlewares ── */
+app.set('trust proxy', 1); // Render est derrière un reverse proxy
+
 app.use(cors({
   origin: [ALLOWED_ORIGIN, 'http://localhost:3000', 'http://127.0.0.1:5500'],
   methods: ['GET', 'POST'],
@@ -299,22 +301,23 @@ async function fetchTicketmasterEvents(query = '', size = 100) {
       }
 
       results.push({
-        source:   'ticketmaster',
-        tm_id:    ev.id,
-        name:     ev.name || '',
-        date:     ev.dates?.start?.localDate || '',
-        venue:    venue.name || '',
-        city:     venue.city?.name || '',
+        source:     'ticketmaster',
+        tm_id:      ev.id,
+        name:       ev.name || '',
+        date:       ev.dates?.start?.localDate || '',
+        venue:      venue.name || '',
+        city:       venue.city?.name || '',
         country,
-        cat:      segment,
-        platform: 'Ticketmaster',
+        cat:        segment,
+        platform:   'Ticketmaster',
         face,
-        face_max: faceMax,
+        face_max:   faceMax,
         resale,
-        score:    Math.round(popularity * 10) / 10,
+        score:      Math.round(popularity * 10) / 10,
         marge,
-        url:      ev.url || '',
-        flag:     countryToFlag(country),
+        url:        ev.url || '',
+        flag:       countryToFlag(country),
+        discovered: face === 0, // event sans prix = découverte, pas encore coté
       });
     });
 
@@ -382,8 +385,13 @@ app.get('/api/scan', async (req, res) => {
 
     // Merge + dedupe + filter
     const all = dedupeEvents([...sg, ...tm, ...manual])
-      .filter(ev => ev.marge >= minMarge)
-      .sort((a, b) => b.marge - a.marge)
+      .filter(ev => ev.marge >= minMarge || (minMarge === 0 && ev.discovered))
+      .sort((a, b) => {
+        // Events avec prix en premier, puis découvertes par date
+        if (a.marge !== b.marge) return b.marge - a.marge;
+        if (a.discovered !== b.discovered) return a.discovered ? 1 : -1;
+        return 0;
+      })
       .slice(0, maxLimit);
 
     const elapsed = Date.now() - startTime;
