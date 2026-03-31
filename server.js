@@ -240,23 +240,26 @@ async function fetchTicketmasterEvents(query = '', size = 100) {
   if (!TICKETMASTER_API_KEY) return [];
   try {
     // Step 1: Discovery — find events
+    // Date range : aujourd'hui → +12 mois
+    const now   = new Date();
+    const later = new Date(now);
+    later.setFullYear(later.getFullYear() + 1);
+
     const discParams = new URLSearchParams({
-      apikey:       TICKETMASTER_API_KEY,
-      size:         String(Math.min(size, 100)), // max 100 sur plan gratuit
-      sort:         'date,asc',
-      includeTBA:   'no',
-      includeTBD:   'no',
+      apikey:         TICKETMASTER_API_KEY,
+      size:           String(Math.min(size, 100)),
+      sort:           'relevance,desc',   // les plus populaires en premier
+      includeTBA:     'no',
+      includeTBD:     'no',
+      countryCode:    'US,GB',
+      classificationName: query || 'music,sports', // concerts + sport
+      startDateTime:  now.toISOString().slice(0,19) + 'Z',
+      endDateTime:    later.toISOString().slice(0,19) + 'Z',
+      onsaleOnStartDate: 'false',
     });
-    // Filtres par défaut si pas de query : Europe + grands marchés
-    if (!query) {
-      discParams.set('countryCode', 'US,GB');
-      discParams.set('segmentName', 'Music');
-      // Date range : events dans les 12 prochains mois
-      const now   = new Date();
-      const later = new Date(now);
-      later.setFullYear(later.getFullYear() + 1);
-      discParams.set('startDateTime', now.toISOString().slice(0,19) + 'Z');
-      discParams.set('endDateTime',   later.toISOString().slice(0,19) + 'Z');
+    if (query) {
+      discParams.delete('classificationName');
+      discParams.set('keyword', query);
     }
     // Remove undefined params
     [...discParams.keys()].forEach(k => { if (discParams.get(k) === 'undefined') discParams.delete(k); });
@@ -289,7 +292,8 @@ async function fetchTicketmasterEvents(query = '', size = 100) {
           const resale  = resaleP.minPrice || 0;
           const marge   = face > 0 && resale > 0 ? Math.round(((resale - face) / face) * 100) : 0;
 
-          if (face > 0) {
+          // Ne garder que les events avec un vrai marché resale (face > 30€)
+          if (face >= 30) {
             const taxonomy = (ev.classifications || [])[0] || {};
             const segment  = taxonomy.segment?.name?.toLowerCase() || 'event';
             results.push({
@@ -318,7 +322,7 @@ async function fetchTicketmasterEvents(query = '', size = 100) {
         chunk.forEach(ev => {
           const priceRange = (ev.priceRanges || [])[0] || {};
           const face = priceRange.min || 0;
-          if (face > 0) {
+          if (face >= 30) {
             results.push({
               source: 'ticketmaster', tm_id: ev.id,
               name: ev.name || '', date: ev.dates?.start?.localDate || '',
