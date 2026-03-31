@@ -233,7 +233,7 @@ async function fetchSeatGeekEvents(query = '', perPage = 50) {
 }
 
 /**
- * Fetch events from Ticketmaster Discovery API + Inventory Status
+ * Fetch events from Ticketmaster Discovery API
  * Docs: https://developer.ticketmaster.com
  */
 async function fetchTicketmasterEvents(query = '', size = 100) {
