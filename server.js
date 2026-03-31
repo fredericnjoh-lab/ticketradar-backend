@@ -240,29 +240,23 @@ async function fetchTicketmasterEvents(query = '', size = 100) {
   if (!TICKETMASTER_API_KEY) return [];
   try {
     // Step 1: Discovery — find events
-    // Date range : aujourd'hui → +12 mois
     const now   = new Date();
     const later = new Date(now);
     later.setFullYear(later.getFullYear() + 1);
 
+    // Paramètres minimaux validés par la doc TM
     const discParams = new URLSearchParams({
-      apikey:        TICKETMASTER_API_KEY,
-      size:          String(Math.min(size, 100)),
-      sort:          'relevance,desc',
-      includeTBA:    'no',
-      includeTBD:    'no',
-      countryCode:   'US,GB',
-      startDateTime: now.toISOString().slice(0,19) + 'Z',
-      endDateTime:   later.toISOString().slice(0,19) + 'Z',
+      apikey:            TICKETMASTER_API_KEY,
+      size:              String(Math.min(size, 100)),
+      countryCode:       'US,GB',
+      classificationName: 'music',
+      startDateTime:     now.toISOString().slice(0,19) + 'Z',
+      endDateTime:       later.toISOString().slice(0,19) + 'Z',
     });
-    // segmentName doit être passé séparément (pas de virgule)
-    if (!query) {
-      discParams.set('segmentName', 'Music');
-    } else {
+    if (query) {
       discParams.set('keyword', query);
+      discParams.delete('classificationName');
     }
-    // Remove undefined params
-    [...discParams.keys()].forEach(k => { if (!discParams.get(k) || discParams.get(k) === 'undefined') discParams.delete(k); });
 
     const discUrl = `https://app.ticketmaster.com/discovery/v2/events.json?${discParams}`;
     console.log('[TM] Discovery URL:', discUrl.replace(TICKETMASTER_API_KEY, '***'));
