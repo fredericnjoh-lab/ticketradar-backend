@@ -244,94 +244,81 @@ async function fetchTicketmasterEvents(query = '', size = 100) {
     const later = new Date(now);
     later.setFullYear(later.getFullYear() + 1);
 
-    // Paramètres minimaux validés par la doc TM
-    const discParams = new URLSearchParams({
-      apikey:            TICKETMASTER_API_KEY,
-      size:              String(Math.min(size, 100)),
-      countryCode:       'US,GB',
-      classificationName: 'music',
-      startDateTime:     now.toISOString().slice(0,19) + 'Z',
-      endDateTime:       later.toISOString().slice(0,19) + 'Z',
-    });
-    if (query) {
-      discParams.set('keyword', query);
-      discParams.delete('classificationName');
-    }
-
-    const discUrl = `https://app.ticketmaster.com/discovery/v2/events.json?${discParams}`;
-    console.log('[TM] Discovery URL:', discUrl.replace(TICKETMASTER_API_KEY, '***'));
-    const discRes  = await axios.get(discUrl, { timeout: 12000 });
-    console.log('[TM] Discovery response status:', discRes.status, '— events:', discRes.data?._embedded?.events?.length || 0);
-    const events   = discRes.data?._embedded?.events || [];
-
-    // Step 2: Inventory Status — get resale prices (batch by 10)
-    const results = [];
-    const chunks  = [];
-    for (let i = 0; i < events.length; i += 10) chunks.push(events.slice(i, i + 10));
-
-    for (const chunk of chunks) {
-      const ids = chunk.map(e => e.id).join(',');
-      try {
-        const invUrl = `https://app.ticketmaster.com/inventory-status/v1/availability?events=${ids}&apikey=${TICKETMASTER_API_KEY}`;
-        const invRes = await axios.get(invUrl, { timeout: 8000 });
-        const invMap = {};
-        (invRes.data || []).forEach(item => { invMap[item.eventId] = item; });
-
-        chunk.forEach(ev => {
-          const inv     = invMap[ev.id] || {};
-          const primary = (inv.priceRanges || []).find(p => p.type === 'primary') || {};
-          const resaleP = (inv.priceRanges || []).find(p => p.type === 'resale')  || {};
-          const face    = primary.minPrice || 0;
-          const resale  = resaleP.minPrice || 0;
-          const marge   = face > 0 && resale > 0 ? Math.round(((resale - face) / face) * 100) : 0;
-
-          // Ne garder que les events avec un vrai marché resale (face > 30€)
-          if (face >= 30) {
-            const taxonomy = (ev.classifications || [])[0] || {};
-            const segment  = taxonomy.segment?.name?.toLowerCase() || 'event';
-            results.push({
-              source:   'ticketmaster',
-              tm_id:    ev.id,
-              name:     ev.name || '',
-              date:     ev.dates?.start?.localDate || '',
-              venue:    ev._embedded?.venues?.[0]?.name || '',
-              city:     ev._embedded?.venues?.[0]?.city?.name || '',
-              country:  ev._embedded?.venues?.[0]?.country?.countryCode || '',
-              cat:      segment,
-              platform: 'Ticketmaster',
-              face,
-              resale:   resale || face,
-              resale_max: primary.maxPrice || 0,
-              score:    8,
-              marge,
-              url:      ev.url || '',
-              flag:     countryToFlag(ev._embedded?.venues?.[0]?.country?.countryCode || ''),
-            });
-          }
-        });
-      } catch (err) {
-        console.error('[TM Inventory] Chunk error:', err.message);
-        // Push events without resale prices
-        chunk.forEach(ev => {
-          const priceRange = (ev.priceRanges || [])[0] || {};
-          const face = priceRange.min || 0;
-          if (face >= 30) {
-            results.push({
-              source: 'ticketmaster', tm_id: ev.id,
-              name: ev.name || '', date: ev.dates?.start?.localDate || '',
-              venue: ev._embedded?.venues?.[0]?.name || '',
-              city: ev._embedded?.venues?.[0]?.city?.name || '',
-              country: ev._embedded?.venues?.[0]?.country?.countryCode || '',
-              cat: 'event', platform: 'Ticketmaster',
-              face, resale: face, marge: 0, score: 7,
-              url: ev.url || '',
-              flag: countryToFlag(ev._embedded?.venues?.[0]?.country?.countryCode || ''),
-            });
-          }
-        });
+    // TM ne supporte qu'un seul countryCode — 2 appels parallèles US + GB
+    const buildUrl = (country) => {
+      let url = 'https://app.ticketmaster.com/discovery/v2/events.json'
+        + '?apikey='        + TICKETMASTER_API_KEY
+        + '&size='          + Math.min(Math.ceil(size / 2), 50)
+        + '&countryCode='   + country
+        + '&startDateTime=' + now.toISOString().slice(0,19) + 'Z'
+        + '&endDateTime='   + later.toISOString().slice(0,19) + 'Z';
+      if (query) {
+        url += '&keyword=' + encodeURIComponent(query);
+      } else {
+        url += '&classificationName=music';
       }
-      await new Promise(r => setTimeout(r, 200)); // respect rate limit
-    }
+      return url;
+    };
+
+    const urlUS = buildUrl('US');
+    const urlGB = buildUrl('GB');
+    console.log('[TM] URL US:', urlUS.replace(TICKETMASTER_API_KEY, '***'));
+
+    const [resUS, resGB] = await Promise.allSettled([
+      axios.get(urlUS, { timeout: 12000 }),
+      axios.get(urlGB, { timeout: 12000 }),
+    ]);
+
+    const evUS = resUS.status === 'fulfilled' ? (resUS.value.data?._embedded?.events || []) : [];
+    const evGB = resGB.status === 'fulfilled' ? (resGB.value.data?._embedded?.events || []) : [];
+    const events = [...evUS, ...evGB];
+    console.log('[TM] Events:', evUS.length, 'US +', evGB.length, 'GB =', events.length, 'total');
+
+    // Step 2 : prix extraits directement depuis Discovery (priceRanges inclus)
+    // L'Inventory Status API nécessite un accès Partner — on estime le resale
+    // à partir du spread face/max et du score de popularité TM
+    const results = [];
+
+    events.forEach(ev => {
+      const priceRange = (ev.priceRanges || [])[0] || {};
+      const face       = priceRange.min || 0;
+      const faceMax    = priceRange.max || face;
+      if (face < 30) return; // ignorer les petits events
+
+      const taxonomy   = (ev.classifications || [])[0] || {};
+      const segment    = taxonomy.segment?.name?.toLowerCase() || 'event';
+      const venue      = ev._embedded?.venues?.[0] || {};
+      const country    = venue.country?.countryCode || '';
+      const popularity = ev.score || 0; // score TM entre 0 et 1
+
+      // Estimation resale : multiplicateur basé sur spread prix + popularité
+      const spread     = faceMax > face ? (faceMax / face) : 1;
+      const multiplier = Math.min(3.5, 1.15 + (spread - 1) * 0.4 + popularity * 1.5);
+      const resale     = Math.round(face * multiplier);
+      const net        = resale * 0.85;
+      const marge      = Math.round(((net - face) / face) * 100);
+
+      results.push({
+        source:   'ticketmaster',
+        tm_id:    ev.id,
+        name:     ev.name || '',
+        date:     ev.dates?.start?.localDate || '',
+        venue:    venue.name || '',
+        city:     venue.city?.name || '',
+        country,
+        cat:      segment,
+        platform: 'Ticketmaster',
+        face,
+        face_max: faceMax,
+        resale,
+        score:    Math.round(popularity * 10) / 10,
+        marge,
+        url:      ev.url || '',
+        flag:     countryToFlag(country),
+      });
+    });
+
+    console.log(`[TM] ${results.length} events avec prix estimés`);
     return results;
   } catch (err) {
     console.error('[Ticketmaster] Erreur:', err.message);
