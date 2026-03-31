@@ -246,24 +246,23 @@ async function fetchTicketmasterEvents(query = '', size = 100) {
     later.setFullYear(later.getFullYear() + 1);
 
     const discParams = new URLSearchParams({
-      apikey:         TICKETMASTER_API_KEY,
-      size:           String(Math.min(size, 100)),
-      sort:           'relevance,desc',   // les plus populaires en premier
-      includeTBA:     'no',
-      includeTBD:     'no',
-      countryCode:    'US,GB',
-      classificationName: query || 'music,sports', // concerts + sport
-      startDateTime:  now.toISOString().slice(0,19) + 'Z',
-      endDateTime:    later.toISOString().slice(0,19) + 'Z',
-      onsaleOnStartDate: 'false',
+      apikey:        TICKETMASTER_API_KEY,
+      size:          String(Math.min(size, 100)),
+      sort:          'relevance,desc',
+      includeTBA:    'no',
+      includeTBD:    'no',
+      countryCode:   'US,GB',
+      startDateTime: now.toISOString().slice(0,19) + 'Z',
+      endDateTime:   later.toISOString().slice(0,19) + 'Z',
     });
-    if (query) {
-      discParams.delete('classificationName');
+    // segmentName doit être passé séparément (pas de virgule)
+    if (!query) {
+      discParams.set('segmentName', 'Music');
+    } else {
       discParams.set('keyword', query);
     }
     // Remove undefined params
-    [...discParams.keys()].forEach(k => { if (discParams.get(k) === 'undefined') discParams.delete(k); });
-    if (query) discParams.set('keyword', query);
+    [...discParams.keys()].forEach(k => { if (!discParams.get(k) || discParams.get(k) === 'undefined') discParams.delete(k); });
 
     const discUrl = `https://app.ticketmaster.com/discovery/v2/events.json?${discParams}`;
     console.log('[TM] Discovery URL:', discUrl.replace(TICKETMASTER_API_KEY, '***'));
