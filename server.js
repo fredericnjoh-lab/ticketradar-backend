@@ -236,19 +236,28 @@ async function fetchSeatGeekEvents(query = '', perPage = 50) {
  * Fetch events from Ticketmaster Discovery API + Inventory Status
  * Docs: https://developer.ticketmaster.com
  */
-async function fetchTicketmasterEvents(query = '', size = 20) {
+async function fetchTicketmasterEvents(query = '', size = 100) {
   if (!TICKETMASTER_API_KEY) return [];
   try {
     // Step 1: Discovery — find events
     const discParams = new URLSearchParams({
       apikey:       TICKETMASTER_API_KEY,
-      size:         String(size),
+      size:         String(Math.min(size, 100)), // max 100 sur plan gratuit
       sort:         'date,asc',
       includeTBA:   'no',
       includeTBD:   'no',
-      countryCode:  'FR,GB,DE,ES,IT,US,BE,NL',
-      segmentName:  query ? undefined : 'Music,Sports',
     });
+    // Filtres par défaut si pas de query : Europe + grands marchés
+    if (!query) {
+      discParams.set('countryCode', 'US,GB');
+      discParams.set('segmentName', 'Music');
+      // Date range : events dans les 12 prochains mois
+      const now   = new Date();
+      const later = new Date(now);
+      later.setFullYear(later.getFullYear() + 1);
+      discParams.set('startDateTime', now.toISOString().slice(0,19) + 'Z');
+      discParams.set('endDateTime',   later.toISOString().slice(0,19) + 'Z');
+    }
     // Remove undefined params
     [...discParams.keys()].forEach(k => { if (discParams.get(k) === 'undefined') discParams.delete(k); });
     if (query) discParams.set('keyword', query);
@@ -379,7 +388,7 @@ app.get('/api/scan', async (req, res) => {
     // Fetch all sources in parallel
     const [sgEvents, tmEvents, sheetEvents] = await Promise.allSettled([
       source !== 'ticketmaster' ? fetchSeatGeekEvents(q, 50) : Promise.resolve([]),
-      source !== 'seatgeek'     ? fetchTicketmasterEvents(q, 20) : Promise.resolve([]),
+      source !== 'seatgeek'     ? fetchTicketmasterEvents(q, 100) : Promise.resolve([]),
       sheet === 'true'          ? fetchSheetEvents() : Promise.resolve([]),
     ]);
 
@@ -430,7 +439,7 @@ app.get('/api/scan/top', async (req, res) => {
   const seuil = parseInt(req.query.seuil) || 30;
   try {
     const [sg, manual] = await Promise.all([
-      fetchSeatGeekEvents('', 30),
+      fetchSeatGeekEvents('', 50),
       fetchSheetEvents(),
     ]);
     const all = dedupeEvents([...sg, ...manual])
