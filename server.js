@@ -30,6 +30,13 @@ const ALLOWED_ORIGIN   = process.env.ALLOWED_ORIGIN || 'https://fredericnjoh-lab
 if (!TELEGRAM_TOKEN)   console.warn('⚠ TELEGRAM_TOKEN manquant');
 if (!TELEGRAM_CHAT_ID) console.warn('⚠ TELEGRAM_CHAT_ID manquant');
 
+const SEATGEEK_CLIENT_ID     = process.env.SEATGEEK_CLIENT_ID     || '';
+const SEATGEEK_CLIENT_SECRET = process.env.SEATGEEK_CLIENT_SECRET || '';
+const TICKETMASTER_API_KEY   = process.env.TICKETMASTER_API_KEY   || '';
+
+if (!SEATGEEK_CLIENT_ID)   console.warn('⚠ SEATGEEK_CLIENT_ID manquant — /api/scan limité');
+if (!TICKETMASTER_API_KEY) console.warn('⚠ TICKETMASTER_API_KEY manquant — /api/scan limité');
+
 /* ── Middlewares ── */
 app.use(cors({
   origin: [ALLOWED_ORIGIN, 'http://localhost:3000', 'http://127.0.0.1:5500'],
@@ -109,13 +116,15 @@ function validateEvent(ev) {
 /* Health check */
 app.get('/api/health', (req, res) => {
   res.json({
-    status:    'ok',
-    version:   '5.1',
-    telegram:  TELEGRAM_TOKEN   ? 'configured' : 'missing',
-    sheet:     SHEET_URL        ? 'configured' : 'missing',
-    chat_id:   TELEGRAM_CHAT_ID ? 'configured' : 'missing',
-    sheet_url: SHEET_URL ? SHEET_URL.slice(0, 60) + '...' : 'not set',
-    timestamp: new Date().toISOString(),
+    status:      'ok',
+    version:     '6.0',
+    telegram:    TELEGRAM_TOKEN       ? 'configured' : 'missing',
+    seatgeek:    SEATGEEK_CLIENT_ID   ? 'configured' : 'missing',
+    ticketmaster: TICKETMASTER_API_KEY ? 'configured' : 'missing',
+    sheet:       SHEET_URL            ? 'configured' : 'missing',
+    chat_id:     TELEGRAM_CHAT_ID     ? 'configured' : 'missing',
+    endpoints:   ['/api/scan', '/api/scan/top', '/api/notify', '/api/countdown'],
+    timestamp:   new Date().toISOString(),
   });
 });
 
@@ -167,6 +176,264 @@ app.post('/api/notify', async (req, res) => {
     drops: validDrops.length,
     timestamp: new Date().toISOString(),
   });
+});
+
+
+/* ════════════════════════════════════════
+   SCAN ENGINE — SeatGeek + Ticketmaster
+════════════════════════════════════════ */
+
+/**
+ * Fetch events from SeatGeek API
+ * Docs: https://developer.seatgeek.com
+ */
+async function fetchSeatGeekEvents(query = '', perPage = 50) {
+  if (!SEATGEEK_CLIENT_ID) return [];
+  try {
+    const params = new URLSearchParams({
+      client_id: SEATGEEK_CLIENT_ID,
+      per_page:  perPage,
+      sort:      'score.desc',
+    });
+    if (query) params.set('q', query);
+
+    const url = `https://api.seatgeek.com/2/events?${params}`;
+    const res = await axios.get(url, { timeout: 10000 });
+    return (res.data.events || []).map(ev => {
+      const stats    = ev.stats || {};
+      const lowest   = stats.lowest_price || 0;
+      const avg      = stats.average_price || 0;
+      const face     = stats.list_price_change != null ? lowest * 0.7 : lowest * 0.65; // estimate face value
+      const marge    = face > 0 ? Math.round(((lowest - face) / face) * 100) : 0;
+      const taxonomy = (ev.taxonomies || [])[0] || {};
+      return {
+        source:      'seatgeek',
+        sg_id:       ev.id,
+        name:        ev.title || ev.short_title || '',
+        date:        ev.datetime_local ? ev.datetime_local.slice(0,10) : '',
+        venue:       ev.venue ? ev.venue.name : '',
+        city:        ev.venue ? ev.venue.city : '',
+        country:     ev.venue ? (ev.venue.country || '') : '',
+        cat:         taxonomy.name || 'event',
+        platform:    'SeatGeek',
+        face:        Math.round(face),
+        resale:      lowest,
+        resale_avg:  avg,
+        resale_max:  stats.highest_price || 0,
+        score:       Math.round((ev.score || 0) * 10) / 10,
+        marge,
+        url:         ev.url || '',
+        flag:        countryToFlag(ev.venue ? ev.venue.country : ''),
+      };
+    }).filter(e => e.name && e.resale > 0);
+  } catch (err) {
+    console.error('[SeatGeek] Erreur:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Fetch events from Ticketmaster Discovery API + Inventory Status
+ * Docs: https://developer.ticketmaster.com
+ */
+async function fetchTicketmasterEvents(query = '', size = 20) {
+  if (!TICKETMASTER_API_KEY) return [];
+  try {
+    // Step 1: Discovery — find events
+    const discParams = new URLSearchParams({
+      apikey:       TICKETMASTER_API_KEY,
+      size,
+      sort:         'relevance,desc',
+      includeTBA:   'no',
+      includeTBD:   'no',
+    });
+    if (query) discParams.set('keyword', query);
+
+    const discUrl = `https://app.ticketmaster.com/discovery/v2/events.json?${discParams}`;
+    const discRes  = await axios.get(discUrl, { timeout: 10000 });
+    const events   = discRes.data?._embedded?.events || [];
+
+    // Step 2: Inventory Status — get resale prices (batch by 10)
+    const results = [];
+    const chunks  = [];
+    for (let i = 0; i < events.length; i += 10) chunks.push(events.slice(i, i + 10));
+
+    for (const chunk of chunks) {
+      const ids = chunk.map(e => e.id).join(',');
+      try {
+        const invUrl = `https://app.ticketmaster.com/inventory-status/v1/availability?events=${ids}&apikey=${TICKETMASTER_API_KEY}`;
+        const invRes = await axios.get(invUrl, { timeout: 8000 });
+        const invMap = {};
+        (invRes.data || []).forEach(item => { invMap[item.eventId] = item; });
+
+        chunk.forEach(ev => {
+          const inv     = invMap[ev.id] || {};
+          const primary = (inv.priceRanges || []).find(p => p.type === 'primary') || {};
+          const resaleP = (inv.priceRanges || []).find(p => p.type === 'resale')  || {};
+          const face    = primary.minPrice || 0;
+          const resale  = resaleP.minPrice || 0;
+          const marge   = face > 0 && resale > 0 ? Math.round(((resale - face) / face) * 100) : 0;
+
+          if (face > 0) {
+            const taxonomy = (ev.classifications || [])[0] || {};
+            const segment  = taxonomy.segment?.name?.toLowerCase() || 'event';
+            results.push({
+              source:   'ticketmaster',
+              tm_id:    ev.id,
+              name:     ev.name || '',
+              date:     ev.dates?.start?.localDate || '',
+              venue:    ev._embedded?.venues?.[0]?.name || '',
+              city:     ev._embedded?.venues?.[0]?.city?.name || '',
+              country:  ev._embedded?.venues?.[0]?.country?.countryCode || '',
+              cat:      segment,
+              platform: 'Ticketmaster',
+              face,
+              resale:   resale || face,
+              resale_max: primary.maxPrice || 0,
+              score:    8,
+              marge,
+              url:      ev.url || '',
+              flag:     countryToFlag(ev._embedded?.venues?.[0]?.country?.countryCode || ''),
+            });
+          }
+        });
+      } catch (err) {
+        console.error('[TM Inventory] Chunk error:', err.message);
+        // Push events without resale prices
+        chunk.forEach(ev => {
+          const priceRange = (ev.priceRanges || [])[0] || {};
+          const face = priceRange.min || 0;
+          if (face > 0) {
+            results.push({
+              source: 'ticketmaster', tm_id: ev.id,
+              name: ev.name || '', date: ev.dates?.start?.localDate || '',
+              venue: ev._embedded?.venues?.[0]?.name || '',
+              city: ev._embedded?.venues?.[0]?.city?.name || '',
+              country: ev._embedded?.venues?.[0]?.country?.countryCode || '',
+              cat: 'event', platform: 'Ticketmaster',
+              face, resale: face, marge: 0, score: 7,
+              url: ev.url || '',
+              flag: countryToFlag(ev._embedded?.venues?.[0]?.country?.countryCode || ''),
+            });
+          }
+        });
+      }
+      await new Promise(r => setTimeout(r, 200)); // respect rate limit
+    }
+    return results;
+  } catch (err) {
+    console.error('[Ticketmaster] Erreur:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Country code → flag emoji
+ */
+function countryToFlag(code) {
+  const map = {
+    FR:'🇫🇷', GB:'🇬🇧', UK:'🇬🇧', US:'🇺🇸', DE:'🇩🇪', ES:'🇪🇸',
+    IT:'🇮🇹', NL:'🇳🇱', BE:'🇧🇪', CH:'🇨🇭', MC:'🇲🇨', JP:'🇯🇵',
+    AU:'🇦🇺', CA:'🇨🇦', PT:'🇵🇹', AT:'🇦🇹', SE:'🇸🇪', NO:'🇳🇴',
+  };
+  return map[(code || '').toUpperCase()] || '🎫';
+}
+
+/**
+ * Deduplicate events from multiple sources by name similarity
+ */
+function dedupeEvents(events) {
+  const seen = new Map();
+  return events.filter(ev => {
+    const key = ev.name.toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,20);
+    if (seen.has(key)) return false;
+    seen.set(key, true);
+    return true;
+  });
+}
+
+/* ── GET /api/scan ── Main scanner endpoint ── */
+app.get('/api/scan', async (req, res) => {
+  const {
+    q        = '',           // search query (optional)
+    seuil    = 0,            // min margin % filter
+    limit    = 50,           // max results
+    source   = 'all',        // 'seatgeek' | 'ticketmaster' | 'all'
+    sheet    = 'true',       // include sheet events
+  } = req.query;
+
+  const minMarge = parseInt(seuil) || 0;
+  const maxLimit = Math.min(parseInt(limit) || 50, 100);
+  const startTime = Date.now();
+
+  console.log(`[Scan] Démarrage — query="${q}" seuil=${minMarge}% source=${source}`);
+
+  try {
+    // Fetch all sources in parallel
+    const [sgEvents, tmEvents, sheetEvents] = await Promise.allSettled([
+      source !== 'ticketmaster' ? fetchSeatGeekEvents(q, 50) : Promise.resolve([]),
+      source !== 'seatgeek'     ? fetchTicketmasterEvents(q, 20) : Promise.resolve([]),
+      sheet === 'true'          ? fetchSheetEvents() : Promise.resolve([]),
+    ]);
+
+    const sg     = sgEvents.status     === 'fulfilled' ? sgEvents.value     : [];
+    const tm     = tmEvents.status     === 'fulfilled' ? tmEvents.value     : [];
+    const manual = sheetEvents.status  === 'fulfilled' ? sheetEvents.value  : [];
+
+    // Merge + dedupe + filter
+    const all = dedupeEvents([...sg, ...tm, ...manual])
+      .filter(ev => ev.marge >= minMarge)
+      .sort((a, b) => b.marge - a.marge)
+      .slice(0, maxLimit);
+
+    const elapsed = Date.now() - startTime;
+    console.log(`[Scan] Terminé — ${sg.length} SG + ${tm.length} TM + ${manual.length} sheet → ${all.length} résultats (${elapsed}ms)`);
+
+    // Auto-alert via Telegram if high-margin events found
+    const hotEvents = all.filter(ev => ev.marge >= 100).slice(0, 3);
+    if (hotEvents.length && TELEGRAM_CHAT_ID) {
+      const alertMsg =
+        `🔥 <b>TicketRadar — ${hotEvents.length} opportunité${hotEvents.length > 1 ? 's' : ''} live !</b>
+
+` +
+        hotEvents.map((ev, i) => formatEventMsg(ev, i + 1)).join('\n\n') +
+        `
+
+👉 <a href="https://fredericnjoh-lab.github.io/ticketradar/">Ouvrir TicketRadar</a>`;
+      sendTelegram(alertMsg).catch(() => {}); // fire-and-forget
+    }
+
+    res.json({
+      success:   true,
+      total:     all.length,
+      sources:   { seatgeek: sg.length, ticketmaster: tm.length, sheet: manual.length },
+      elapsed_ms: elapsed,
+      events:    all,
+      timestamp: new Date().toISOString(),
+    });
+
+  } catch (err) {
+    console.error('[Scan] Erreur critique:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ── GET /api/scan/top ── Top opportunités rapide ── */
+app.get('/api/scan/top', async (req, res) => {
+  const seuil = parseInt(req.query.seuil) || 30;
+  try {
+    const [sg, manual] = await Promise.all([
+      fetchSeatGeekEvents('', 30),
+      fetchSheetEvents(),
+    ]);
+    const all = dedupeEvents([...sg, ...manual])
+      .filter(ev => ev.marge >= seuil)
+      .sort((a, b) => b.marge - a.marge)
+      .slice(0, 10);
+    res.json({ total: all.length, events: all, timestamp: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 /* ── GET /api/test ── */
@@ -595,13 +862,13 @@ scheduleCountdownCheck();
 app.use((req, res) => {
   res.status(404).json({ 
     error: 'Route non trouvée', 
-    available: ['/api/health', '/api/notify', '/api/test', '/api/prices', '/api/countdown', '/api/countdown/check', '/webhook', '/webhook/setup'] 
+    available: ['/api/health', '/api/scan', '/api/scan/top', '/api/notify', '/api/test', '/api/countdown', '/api/countdown/check', '/webhook', '/webhook/setup'] 
   });
 });
 
 /* ── Start ── */
 app.listen(PORT, () => {
-  console.log(`\n🎫 TicketRadar Backend v5`);
+  console.log(`\n🎫 TicketRadar Backend v6`);
   console.log(`📡 Écoute sur http://localhost:${PORT}`);
   console.log(`🔒 Telegram : ${TELEGRAM_TOKEN ? '✓ configuré' : '✗ manquant'}`);
   console.log(`🌍 CORS : ${ALLOWED_ORIGIN}\n`);
