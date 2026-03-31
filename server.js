@@ -242,15 +242,21 @@ async function fetchTicketmasterEvents(query = '', size = 20) {
     // Step 1: Discovery — find events
     const discParams = new URLSearchParams({
       apikey:       TICKETMASTER_API_KEY,
-      size,
-      sort:         'relevance,desc',
+      size:         String(size),
+      sort:         'date,asc',
       includeTBA:   'no',
       includeTBD:   'no',
+      countryCode:  'FR,GB,DE,ES,IT,US,BE,NL',
+      segmentName:  query ? undefined : 'Music,Sports',
     });
+    // Remove undefined params
+    [...discParams.keys()].forEach(k => { if (discParams.get(k) === 'undefined') discParams.delete(k); });
     if (query) discParams.set('keyword', query);
 
     const discUrl = `https://app.ticketmaster.com/discovery/v2/events.json?${discParams}`;
-    const discRes  = await axios.get(discUrl, { timeout: 10000 });
+    console.log('[TM] Discovery URL:', discUrl.replace(TICKETMASTER_API_KEY, '***'));
+    const discRes  = await axios.get(discUrl, { timeout: 12000 });
+    console.log('[TM] Discovery response status:', discRes.status, '— events:', discRes.data?._embedded?.events?.length || 0);
     const events   = discRes.data?._embedded?.events || [];
 
     // Step 2: Inventory Status — get resale prices (batch by 10)
@@ -323,6 +329,7 @@ async function fetchTicketmasterEvents(query = '', size = 20) {
     return results;
   } catch (err) {
     console.error('[Ticketmaster] Erreur:', err.message);
+    if (err.response) console.error('[TM] Response:', err.response.status, JSON.stringify(err.response.data).slice(0,200));
     return [];
   }
 }
