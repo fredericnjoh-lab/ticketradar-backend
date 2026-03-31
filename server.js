@@ -274,29 +274,29 @@ async function fetchTicketmasterEvents(query = '', size = 100) {
     const events = [...evUS, ...evGB];
     console.log('[TM] Events:', evUS.length, 'US +', evGB.length, 'GB =', events.length, 'total');
 
-    // Step 2 : prix extraits directement depuis Discovery (priceRanges inclus)
-    // L'Inventory Status API nécessite un accès Partner — on estime le resale
-    // à partir du spread face/max et du score de popularité TM
+    // Step 2 : construire les events depuis Discovery
+    // priceRanges souvent absent sur plan gratuit → on garde tous les events
     const results = [];
 
     events.forEach(ev => {
-      const priceRange = (ev.priceRanges || [])[0] || {};
-      const face       = priceRange.min || 0;
-      const faceMax    = priceRange.max || face;
-      if (face < 30) return; // ignorer les petits events
-
       const taxonomy   = (ev.classifications || [])[0] || {};
       const segment    = taxonomy.segment?.name?.toLowerCase() || 'event';
       const venue      = ev._embedded?.venues?.[0] || {};
       const country    = venue.country?.countryCode || '';
-      const popularity = ev.score || 0; // score TM entre 0 et 1
+      const popularity = ev.score || 0;
+      const priceRange = (ev.priceRanges || [])[0] || {};
+      const face       = priceRange.min || 0;
+      const faceMax    = priceRange.max || face;
 
-      // Estimation resale : multiplicateur basé sur spread prix + popularité
-      const spread     = faceMax > face ? (faceMax / face) : 1;
-      const multiplier = Math.min(3.5, 1.15 + (spread - 1) * 0.4 + popularity * 1.5);
-      const resale     = Math.round(face * multiplier);
-      const net        = resale * 0.85;
-      const marge      = Math.round(((net - face) / face) * 100);
+      // Estimation resale si prix dispo, sinon marge = 0
+      let resale = 0;
+      let marge  = 0;
+      if (face >= 30) {
+        const spread     = faceMax > face ? (faceMax / face) : 1;
+        const multiplier = Math.min(3.5, 1.15 + (spread - 1) * 0.4 + popularity * 1.5);
+        resale = Math.round(face * multiplier);
+        marge  = Math.round(((resale * 0.85 - face) / face) * 100);
+      }
 
       results.push({
         source:   'ticketmaster',
@@ -318,7 +318,7 @@ async function fetchTicketmasterEvents(query = '', size = 100) {
       });
     });
 
-    console.log(`[TM] ${results.length} events avec prix estimés`);
+    console.log(`[TM] ${results.length} events extraits (${results.filter(e=>e.face>0).length} avec prix)`);
     return results;
   } catch (err) {
     console.error('[Ticketmaster] Erreur:', err.message);
