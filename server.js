@@ -33,13 +33,13 @@ if (!TELEGRAM_CHAT_ID) console.warn('⚠ TELEGRAM_CHAT_ID manquant');
 const SEATGEEK_CLIENT_ID     = process.env.SEATGEEK_CLIENT_ID     || '';
 const SEATGEEK_CLIENT_SECRET = process.env.SEATGEEK_CLIENT_SECRET || '';
 const TICKETMASTER_API_KEY   = process.env.TICKETMASTER_API_KEY   || '';
+const ANTHROPIC_API_KEY      = process.env.ANTHROPIC_API_KEY      || '';
 
 if (!SEATGEEK_CLIENT_ID)   console.warn('⚠ SEATGEEK_CLIENT_ID manquant — /api/scan limité');
 if (!TICKETMASTER_API_KEY) console.warn('⚠ TICKETMASTER_API_KEY manquant — /api/scan limité');
+if (!ANTHROPIC_API_KEY)    console.warn('⚠ ANTHROPIC_API_KEY manquant — /api/ai désactivé');
 
 /* ── Middlewares ── */
-app.set('trust proxy', 1); // Render est derrière un reverse proxy
-
 app.use(cors({
   origin: [ALLOWED_ORIGIN, 'http://localhost:3000', 'http://127.0.0.1:5500'],
   methods: ['GET', 'POST'],
@@ -123,9 +123,10 @@ app.get('/api/health', (req, res) => {
     telegram:    TELEGRAM_TOKEN       ? 'configured' : 'missing',
     seatgeek:    SEATGEEK_CLIENT_ID   ? 'configured' : 'missing',
     ticketmaster: TICKETMASTER_API_KEY ? 'configured' : 'missing',
+    anthropic:   ANTHROPIC_API_KEY    ? 'configured' : 'missing',
     sheet:       SHEET_URL            ? 'configured' : 'missing',
     chat_id:     TELEGRAM_CHAT_ID     ? 'configured' : 'missing',
-    endpoints:   ['/api/scan', '/api/scan/top', '/api/notify', '/api/countdown'],
+    endpoints:   ['/api/scan', '/api/scan/top', '/api/notify', '/api/ai', '/api/countdown'],
     timestamp:   new Date().toISOString(),
   });
 });
@@ -236,96 +237,58 @@ async function fetchSeatGeekEvents(query = '', perPage = 50) {
 
 /**
  * Fetch events from Ticketmaster Discovery API
+ * Uses priceRanges from Discovery response directly (no Inventory Status API)
  * Docs: https://developer.ticketmaster.com
  */
-async function fetchTicketmasterEvents(query = '', size = 100) {
+async function fetchTicketmasterEvents(query = '', size = 20) {
   if (!TICKETMASTER_API_KEY) return [];
   try {
-    // Step 1: Discovery — find events
-    const now   = new Date();
-    const later = new Date(now);
-    later.setFullYear(later.getFullYear() + 1);
+    const params = new URLSearchParams({
+      apikey:       TICKETMASTER_API_KEY,
+      size,
+      sort:         'relevance,desc',
+      includeTBA:   'no',
+      includeTBD:   'no',
+    });
+    if (query) params.set('keyword', query);
 
-    // TM ne supporte qu'un seul countryCode — 2 appels parallèles US + GB
-    const buildUrl = (country) => {
-      let url = 'https://app.ticketmaster.com/discovery/v2/events.json'
-        + '?apikey='        + TICKETMASTER_API_KEY
-        + '&size='          + Math.min(Math.ceil(size / 2), 50)
-        + '&countryCode='   + country
-        + '&startDateTime=' + now.toISOString().slice(0,19) + 'Z'
-        + '&endDateTime='   + later.toISOString().slice(0,19) + 'Z';
-      if (query) {
-        url += '&keyword=' + encodeURIComponent(query);
-      } else {
-        url += '&classificationName=music';
-      }
-      return url;
-    };
+    const url = `https://app.ticketmaster.com/discovery/v2/events.json?${params}`;
+    const res = await axios.get(url, { timeout: 10000 });
+    const events = res.data?._embedded?.events || [];
 
-    const urlUS = buildUrl('US');
-    const urlGB = buildUrl('GB');
-    console.log('[TM] URL US:', urlUS.replace(TICKETMASTER_API_KEY, '***'));
+    return events.map(ev => {
+      const priceRanges = ev.priceRanges || [];
+      const minPrice    = Math.min(...priceRanges.map(p => p.min || Infinity));
+      const maxPrice    = Math.max(...priceRanges.map(p => p.max || 0));
+      const face        = isFinite(minPrice) ? minPrice : 0;
+      const resale      = maxPrice > face ? maxPrice : 0;
+      const marge       = face > 0 && resale > 0 ? Math.round(((resale * 0.85 - face) / face) * 100) : 0;
+      const taxonomy    = (ev.classifications || [])[0] || {};
+      const segment     = taxonomy.segment?.name?.toLowerCase() || 'event';
+      const countryCode = ev._embedded?.venues?.[0]?.country?.countryCode || '';
 
-    const [resUS, resGB] = await Promise.allSettled([
-      axios.get(urlUS, { timeout: 12000 }),
-      axios.get(urlGB, { timeout: 12000 }),
-    ]);
-
-    const evUS = resUS.status === 'fulfilled' ? (resUS.value.data?._embedded?.events || []) : [];
-    const evGB = resGB.status === 'fulfilled' ? (resGB.value.data?._embedded?.events || []) : [];
-    const events = [...evUS, ...evGB];
-    console.log('[TM] Events:', evUS.length, 'US +', evGB.length, 'GB =', events.length, 'total');
-
-    // Step 2 : construire les events depuis Discovery
-    // priceRanges souvent absent sur plan gratuit → on garde tous les events
-    const results = [];
-
-    events.forEach(ev => {
-      const taxonomy   = (ev.classifications || [])[0] || {};
-      const segment    = taxonomy.segment?.name?.toLowerCase() || 'event';
-      const venue      = ev._embedded?.venues?.[0] || {};
-      const country    = venue.country?.countryCode || '';
-      const popularity = ev.score || 0;
-      const priceRange = (ev.priceRanges || [])[0] || {};
-      const face       = priceRange.min || 0;
-      const faceMax    = priceRange.max || face;
-
-      // Estimation resale si prix dispo, sinon marge = 0
-      let resale = 0;
-      let marge  = 0;
-      if (face >= 30) {
-        const spread     = faceMax > face ? (faceMax / face) : 1;
-        const multiplier = Math.min(3.5, 1.15 + (spread - 1) * 0.4 + popularity * 1.5);
-        resale = Math.round(face * multiplier);
-        marge  = Math.round(((resale * 0.85 - face) / face) * 100);
-      }
-
-      results.push({
+      return {
         source:     'ticketmaster',
         tm_id:      ev.id,
         name:       ev.name || '',
         date:       ev.dates?.start?.localDate || '',
-        venue:      venue.name || '',
-        city:       venue.city?.name || '',
-        country,
+        venue:      ev._embedded?.venues?.[0]?.name || '',
+        city:       ev._embedded?.venues?.[0]?.city?.name || '',
+        country:    countryCode,
         cat:        segment,
         platform:   'Ticketmaster',
         face,
-        face_max:   faceMax,
-        resale,
-        score:      Math.round(popularity * 10) / 10,
+        resale:     resale || face,
+        resale_max: maxPrice,
+        score:      8,
         marge,
         url:        ev.url || '',
-        flag:       countryToFlag(country),
-        discovered: face === 0, // event sans prix = découverte, pas encore coté
-      });
-    });
-
-    console.log(`[TM] ${results.length} events extraits (${results.filter(e=>e.face>0).length} avec prix)`);
-    return results;
+        flag:       countryToFlag(countryCode),
+        discovered: face === 0 && resale === 0,
+      };
+    }).filter(e => e.name);
   } catch (err) {
     console.error('[Ticketmaster] Erreur:', err.message);
-    if (err.response) console.error('[TM] Response:', err.response.status, JSON.stringify(err.response.data).slice(0,200));
     return [];
   }
 }
@@ -375,7 +338,7 @@ app.get('/api/scan', async (req, res) => {
     // Fetch all sources in parallel
     const [sgEvents, tmEvents, sheetEvents] = await Promise.allSettled([
       source !== 'ticketmaster' ? fetchSeatGeekEvents(q, 50) : Promise.resolve([]),
-      source !== 'seatgeek'     ? fetchTicketmasterEvents(q, 100) : Promise.resolve([]),
+      source !== 'seatgeek'     ? fetchTicketmasterEvents(q, 20) : Promise.resolve([]),
       sheet === 'true'          ? fetchSheetEvents() : Promise.resolve([]),
     ]);
 
@@ -385,13 +348,8 @@ app.get('/api/scan', async (req, res) => {
 
     // Merge + dedupe + filter
     const all = dedupeEvents([...sg, ...tm, ...manual])
-      .filter(ev => ev.marge >= minMarge || (minMarge === 0 && ev.discovered))
-      .sort((a, b) => {
-        // Events avec prix en premier, puis découvertes par date
-        if (a.marge !== b.marge) return b.marge - a.marge;
-        if (a.discovered !== b.discovered) return a.discovered ? 1 : -1;
-        return 0;
-      })
+      .filter(ev => ev.marge >= minMarge)
+      .sort((a, b) => b.marge - a.marge)
       .slice(0, maxLimit);
 
     const elapsed = Date.now() - startTime;
@@ -431,7 +389,7 @@ app.get('/api/scan/top', async (req, res) => {
   const seuil = parseInt(req.query.seuil) || 30;
   try {
     const [sg, manual] = await Promise.all([
-      fetchSeatGeekEvents('', 50),
+      fetchSeatGeekEvents('', 30),
       fetchSheetEvents(),
     ]);
     const all = dedupeEvents([...sg, ...manual])
@@ -866,11 +824,48 @@ function scheduleCountdownCheck() {
 // Démarrer le scheduler
 scheduleCountdownCheck();
 
+/* ══════════════════════════════════════════════
+   AI — Proxy Anthropic API (avoids CORS)
+══════════════════════════════════════════════ */
+
+app.post('/api/ai', async (req, res) => {
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(503).json({ error: 'ANTHROPIC_API_KEY non configuré' });
+  }
+
+  const { question, context } = req.body;
+  if (!question || typeof question !== 'string' || question.length > 500) {
+    return res.status(400).json({ error: 'question requise (max 500 caractères)' });
+  }
+
+  try {
+    const response = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 400,
+      system: `Tu es un expert en revente de billets. Contexte marché actuel: ${(context || '').slice(0, 1000)}. Réponds en 2-3 phrases max, direct et actionnable.`,
+      messages: [{ role: 'user', content: question }],
+    }, {
+      timeout: 30000,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+    });
+
+    const answer = response.data?.content?.[0]?.text || '';
+    res.json({ answer });
+  } catch (err) {
+    console.error('[AI] Erreur:', err.response?.data || err.message);
+    res.status(502).json({ error: 'Erreur API Anthropic: ' + (err.response?.data?.error?.message || err.message) });
+  }
+});
+
 /* ── 404 ── */
 app.use((req, res) => {
-  res.status(404).json({ 
-    error: 'Route non trouvée', 
-    available: ['/api/health', '/api/scan', '/api/scan/top', '/api/notify', '/api/test', '/api/countdown', '/api/countdown/check', '/webhook', '/webhook/setup'] 
+  res.status(404).json({
+    error: 'Route non trouvée',
+    available: ['/api/health', '/api/scan', '/api/scan/top', '/api/notify', '/api/ai', '/api/test', '/api/countdown', '/api/countdown/check', '/webhook', '/webhook/setup']
   });
 });
 
