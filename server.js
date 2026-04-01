@@ -842,8 +842,7 @@ app.post('/api/ai', async (req, res) => {
     const response = await axios.post('https://api.anthropic.com/v1/messages', {
       model: 'claude-sonnet-4-20250514',
       max_tokens: 400,
-      system: `Tu es un expert en revente de billets. Contexte marché actuel: ${(context || '').slice(0, 1000)}. Réponds en 2-3 phrases max, direct et actionnable.`,
-      messages: [{ role: 'user', content: question }],
+      system:`You are a ticket resale expert. Current market context: ${(context || '').slice(0, 1000)}. Detect the language of the user's question and always respond in that same language. Keep answers to 2-3 sentences max, direct and actionable.`,
     }, {
       timeout: 30000,
       headers: {
