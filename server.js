@@ -407,19 +407,44 @@ async function getSpotifyToken() {
   }
 }
 
+/**
+ * Extract artist name from event name
+ * "Ariana Grande Eternal Sunshine Tour" → "Ariana Grande"
+ * "Beyoncé Renaissance World Tour" → "Beyoncé"
+ * "Champions League Final" → null (sport, skip)
+ */
+function extractArtist(name) {
+  if (!name) return null;
+  // Strip common tour/event suffixes
+  let artist = name
+    .replace(/\s*(tour|tournée|world tour|european tour|concert|live|show|festival|eternal sunshine|short n sweet|renaissance|the eras|cowboy carter)\b.*$/i, '')
+    .replace(/\s*(at|@|vs\.?)\s.*$/i, '')
+    .replace(/\s*[-–—|]\s.*$/, '')
+    .replace(/\s*\d{4}.*$/, '')
+    .replace(/\s*(finale?|demi-finale|semi-final|quarter-final|group stage)\b.*$/i, '')
+    .trim();
+  return artist.length >= 2 ? artist : null;
+}
+
 async function enrichWithSpotify(events) {
   const token = await getSpotifyToken();
   if (!token) return events;
 
+  // Only enrich concerts, not sport events
+  const concertCats = ['concert', 'music', 'arts'];
+  const sportCats = ['sport', 'sports', 'mma', 'f1'];
   const cache = new Map();
 
   for (const ev of events) {
-    if (!ev.name) continue;
-    // Extract artist name: strip venue/date suffixes, take first meaningful part
-    const artist = ev.name.replace(/\s*(at|@|vs\.?|[-–—].*$|\d{4}.*$)/i, '').trim();
-    if (!artist || artist.length < 2) continue;
-    if (cache.has(artist.toLowerCase())) {
-      const cached = cache.get(artist.toLowerCase());
+    // Skip sport events — Spotify is irrelevant
+    if (sportCats.includes((ev.cat || '').toLowerCase())) continue;
+
+    const artist = extractArtist(ev.name);
+    if (!artist) continue;
+
+    const cacheKey = artist.toLowerCase();
+    if (cache.has(cacheKey)) {
+      const cached = cache.get(cacheKey);
       ev.spotify_popularity = cached.popularity;
       ev.spotify_followers = cached.followers;
       if (cached.popularity > 70) ev.marge = Math.round(ev.marge * 1.15);
@@ -428,23 +453,28 @@ async function enrichWithSpotify(events) {
 
     try {
       const res = await axios.get('https://api.spotify.com/v1/search', {
-        params: { q: artist, type: 'artist', limit: 1 },
+        params: { q: artist, type: 'artist', limit: 3 },
         headers: { Authorization: `Bearer ${token}` },
         timeout: 4000,
       });
       const items = res.data?.artists?.items || [];
-      if (items.length) {
-        const a = items[0];
-        const popularity = a.popularity || 0;
-        const followers = a.followers?.total || 0;
-        ev.spotify_popularity = popularity;
-        ev.spotify_followers = followers;
-        cache.set(artist.toLowerCase(), { popularity, followers });
-        // Boost margin for popular artists (>70 popularity = high demand)
-        if (popularity > 70) ev.marge = Math.round(ev.marge * 1.15);
+      // Pick the best match: prefer exact name match, then highest popularity
+      const exact = items.find(a => a.name.toLowerCase() === artist.toLowerCase());
+      const best = exact || items[0];
+
+      if (best) {
+        const popularity = best.popularity || 0;
+        const followers = best.followers?.total || 0;
+        // Only assign if the match seems relevant (popularity > 0 or exact match)
+        if (popularity > 0 || exact) {
+          ev.spotify_popularity = popularity;
+          ev.spotify_followers = followers;
+          cache.set(cacheKey, { popularity, followers });
+          if (popularity > 70) ev.marge = Math.round(ev.marge * 1.15);
+          console.log(`[Spotify] ${artist} → ${best.name} (${popularity}/100, ${followers.toLocaleString()} followers)`);
+        }
       }
     } catch (err) {
-      // Don't fail the whole enrichment if one lookup fails
       if (err.response?.status === 429) {
         console.warn('[Spotify] Rate limited, stopping enrichment');
         break;
