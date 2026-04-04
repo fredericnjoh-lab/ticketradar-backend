@@ -500,7 +500,8 @@ app.get('/api/spotify/test', async (req, res) => {
     res.json({
       query: q,
       token_ok: true,
-      results: items.map(a => ({ name: a.name, popularity: a.popularity, followers: a.followers?.total })),
+      results: items.map(a => ({ name: a.name, id: a.id, popularity: a.popularity, followers: a.followers?.total, genres: a.genres })),
+      raw_first: items[0] || null,
     });
   } catch (err) {
     res.json({ error: err.message, status: err.response?.status, data: err.response?.data });
