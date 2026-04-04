@@ -37,6 +37,9 @@ const SEATGEEK_CLIENT_SECRET = process.env.SEATGEEK_CLIENT_SECRET || '';
 const TICKETMASTER_API_KEY   = process.env.TICKETMASTER_API_KEY   || '';
 const ANTHROPIC_API_KEY      = process.env.ANTHROPIC_API_KEY      || '';
 
+const SPOTIFY_CLIENT_ID     = (process.env.SPOTIFY_CLIENT_ID     || '').trim();
+const SPOTIFY_CLIENT_SECRET = (process.env.SPOTIFY_CLIENT_SECRET || '').trim();
+
 const STRIPE_SECRET_KEY     = (process.env.STRIPE_SECRET_KEY     || '').trim();
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
 const STRIPE_PRO_PRICE_ID   = (process.env.STRIPE_PRO_PRICE_ID  || '').trim();
@@ -46,6 +49,7 @@ if (!SEATGEEK_CLIENT_ID)   console.warn('⚠ SEATGEEK_CLIENT_ID manquant — /ap
 if (!TICKETMASTER_API_KEY) console.warn('⚠ TICKETMASTER_API_KEY manquant — /api/scan limité');
 if (!ANTHROPIC_API_KEY)    console.warn('⚠ ANTHROPIC_API_KEY manquant — /api/ai désactivé');
 if (!STRIPE_SECRET_KEY)    console.warn('⚠ STRIPE_SECRET_KEY manquant — paiements désactivés');
+if (!SPOTIFY_CLIENT_ID)    console.warn('⚠ SPOTIFY_CLIENT_ID manquant — enrichissement Spotify désactivé');
 
 /* ── Middlewares ── */
 app.use(cors({
@@ -176,6 +180,7 @@ app.get('/api/health', (req, res) => {
     seatgeek:    SEATGEEK_CLIENT_ID   ? 'configured' : 'missing',
     ticketmaster: TICKETMASTER_API_KEY ? 'configured' : 'missing',
     anthropic:   ANTHROPIC_API_KEY    ? 'configured' : 'missing',
+    spotify:     SPOTIFY_CLIENT_ID   ? 'configured' : 'missing',
     stripe:      STRIPE_SECRET_KEY   ? 'configured' : 'missing',
     sheet:       SHEET_URL            ? 'configured' : 'missing',
     chat_id:     TELEGRAM_CHAT_ID     ? 'configured' : 'missing',
@@ -371,6 +376,85 @@ function dedupeEvents(events) {
   });
 }
 
+/* ══════════════════════════════════════════════
+   SPOTIFY — Artist popularity enrichment
+══════════════════════════════════════════════ */
+
+let _spotifyToken = null;
+let _spotifyTokenExpiry = 0;
+
+async function getSpotifyToken() {
+  if (_spotifyToken && Date.now() < _spotifyTokenExpiry) return _spotifyToken;
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) return null;
+
+  try {
+    const res = await axios.post('https://accounts.spotify.com/api/token',
+      'grant_type=client_credentials',
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: 'Basic ' + Buffer.from(SPOTIFY_CLIENT_ID + ':' + SPOTIFY_CLIENT_SECRET).toString('base64'),
+        },
+        timeout: 5000,
+      }
+    );
+    _spotifyToken = res.data.access_token;
+    _spotifyTokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
+    return _spotifyToken;
+  } catch (err) {
+    console.error('[Spotify] Token error:', err.message);
+    return null;
+  }
+}
+
+async function enrichWithSpotify(events) {
+  const token = await getSpotifyToken();
+  if (!token) return events;
+
+  const cache = new Map();
+
+  for (const ev of events) {
+    if (!ev.name) continue;
+    // Extract artist name: strip venue/date suffixes, take first meaningful part
+    const artist = ev.name.replace(/\s*(at|@|vs\.?|[-–—].*$|\d{4}.*$)/i, '').trim();
+    if (!artist || artist.length < 2) continue;
+    if (cache.has(artist.toLowerCase())) {
+      const cached = cache.get(artist.toLowerCase());
+      ev.spotify_popularity = cached.popularity;
+      ev.spotify_followers = cached.followers;
+      if (cached.popularity > 70) ev.marge = Math.round(ev.marge * 1.15);
+      continue;
+    }
+
+    try {
+      const res = await axios.get('https://api.spotify.com/v1/search', {
+        params: { q: artist, type: 'artist', limit: 1 },
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 4000,
+      });
+      const items = res.data?.artists?.items || [];
+      if (items.length) {
+        const a = items[0];
+        const popularity = a.popularity || 0;
+        const followers = a.followers?.total || 0;
+        ev.spotify_popularity = popularity;
+        ev.spotify_followers = followers;
+        cache.set(artist.toLowerCase(), { popularity, followers });
+        // Boost margin for popular artists (>70 popularity = high demand)
+        if (popularity > 70) ev.marge = Math.round(ev.marge * 1.15);
+      }
+    } catch (err) {
+      // Don't fail the whole enrichment if one lookup fails
+      if (err.response?.status === 429) {
+        console.warn('[Spotify] Rate limited, stopping enrichment');
+        break;
+      }
+    }
+  }
+
+  return events;
+}
+
 /* ── GET /api/scan ── Main scanner endpoint ── */
 app.get('/api/scan', async (req, res) => {
   const {
@@ -400,10 +484,15 @@ app.get('/api/scan', async (req, res) => {
     const manual = sheetEvents.status  === 'fulfilled' ? sheetEvents.value  : [];
 
     // Merge + dedupe + filter
-    const all = dedupeEvents([...sg, ...tm, ...manual])
+    let all = dedupeEvents([...sg, ...tm, ...manual])
       .filter(ev => ev.marge >= minMarge)
       .sort((a, b) => b.marge - a.marge)
       .slice(0, maxLimit);
+
+    // Enrich with Spotify artist popularity
+    all = await enrichWithSpotify(all);
+    // Re-sort after Spotify boost
+    all.sort((a, b) => b.marge - a.marge);
 
     const elapsed = Date.now() - startTime;
     console.log(`[Scan] Terminé — ${sg.length} SG + ${tm.length} TM + ${manual.length} sheet → ${all.length} résultats (${elapsed}ms)`);
