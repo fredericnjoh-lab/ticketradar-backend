@@ -17,7 +17,8 @@ const express    = require('express');
 const cors       = require('cors');
 const axios      = require('axios');
 const rateLimit  = require('express-rate-limit');
-const Stripe     = require('stripe');
+let Stripe;
+try { Stripe = require('stripe'); } catch(e) { console.warn('⚠ Module stripe non installé — paiements désactivés'); }
 require('dotenv').config();
 
 const app  = express();
@@ -36,10 +37,10 @@ const SEATGEEK_CLIENT_SECRET = process.env.SEATGEEK_CLIENT_SECRET || '';
 const TICKETMASTER_API_KEY   = process.env.TICKETMASTER_API_KEY   || '';
 const ANTHROPIC_API_KEY      = process.env.ANTHROPIC_API_KEY      || '';
 
-const STRIPE_SECRET_KEY     = process.env.STRIPE_SECRET_KEY     || '';
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
-const STRIPE_PRO_PRICE_ID   = process.env.STRIPE_PRO_PRICE_ID  || '';
-const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+const STRIPE_SECRET_KEY     = (process.env.STRIPE_SECRET_KEY     || '').trim();
+const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+const STRIPE_PRO_PRICE_ID   = (process.env.STRIPE_PRO_PRICE_ID  || '').trim();
+const stripe = (Stripe && STRIPE_SECRET_KEY) ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 if (!SEATGEEK_CLIENT_ID)   console.warn('⚠ SEATGEEK_CLIENT_ID manquant — /api/scan limité');
 if (!TICKETMASTER_API_KEY) console.warn('⚠ TICKETMASTER_API_KEY manquant — /api/scan limité');
@@ -886,15 +887,15 @@ app.post('/api/ai', async (req, res) => {
   }
 
   const { question, context } = req.body;
-  if (!question || typeof question !== 'string' || question.length > 500) {
-    return res.status(400).json({ error: 'question requise (max 500 caractères)' });
+  if (!question || typeof question !== 'string' || question.length > 3000) {
+    return res.status(400).json({ error: 'question requise (max 3000 caractères)' });
   }
 
   try {
     const requestBody = {
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 400,
-      system: `You are a ticket resale expert. Current market context: ${(context || '').slice(0, 1000)}. Detect the language of the user's question and always respond in that same language. Keep answers to 2-3 sentences max, direct and actionable.`,
+      max_tokens: 800,
+      system: `You are a smart assistant. If the context mentions "Goal tracker" or "coach", act as a personal goal coach — give concrete, actionable advice. Otherwise, act as a ticket resale expert. Context: ${(context || '').slice(0, 1000)}. Detect the language of the user's question and always respond in that same language. Keep answers concise, direct and actionable.`,
       messages: [{ role: 'user', content: String(question) }],
     };
     console.log('[AI] Request body:', JSON.stringify(requestBody, null, 2));
@@ -961,8 +962,11 @@ app.get('/api/plans', (req, res) => {
 
 /* ── POST /api/create-checkout ── */
 app.post('/api/create-checkout', async (req, res) => {
-  if (!stripe || !STRIPE_PRO_PRICE_ID) {
-    return res.status(503).json({ error: 'Stripe non configuré' });
+  if (!stripe) {
+    return res.status(503).json({ error: 'Stripe non configuré — STRIPE_SECRET_KEY manquant' });
+  }
+  if (!STRIPE_PRO_PRICE_ID || !STRIPE_PRO_PRICE_ID.startsWith('price_')) {
+    return res.status(503).json({ error: 'STRIPE_PRO_PRICE_ID manquant ou invalide. Crée un prix dans Stripe Dashboard et ajoute l\'ID (price_xxx) dans les env vars.' });
   }
 
   const { email, userId } = req.body;
@@ -981,7 +985,10 @@ app.post('/api/create-checkout', async (req, res) => {
     res.json({ url: session.url });
   } catch (err) {
     console.error('[Stripe] Erreur checkout:', err.message);
-    res.status(500).json({ error: err.message });
+    const msg = err.message.includes('No such price')
+      ? `Price ID invalide : "${STRIPE_PRO_PRICE_ID}". Vérifie dans Stripe Dashboard > Products > Price ID.`
+      : err.message;
+    res.status(500).json({ error: msg });
   }
 });
 
