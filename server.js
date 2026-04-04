@@ -452,26 +452,32 @@ async function enrichWithSpotify(events) {
     }
 
     try {
-      const res = await axios.get('https://api.spotify.com/v1/search', {
+      // Step 1: Search for artist
+      const searchRes = await axios.get('https://api.spotify.com/v1/search', {
         params: { q: artist, type: 'artist', limit: 3 },
         headers: { Authorization: `Bearer ${token}` },
         timeout: 4000,
       });
-      const items = res.data?.artists?.items || [];
-      // Pick the best match: prefer exact name match, then highest popularity
+      const items = searchRes.data?.artists?.items || [];
       const exact = items.find(a => a.name.toLowerCase() === artist.toLowerCase());
       const best = exact || items[0];
 
-      if (best) {
-        const popularity = best.popularity || 0;
-        const followers = best.followers?.total || 0;
-        // Only assign if the match seems relevant (popularity > 0 or exact match)
-        if (popularity > 0 || exact) {
+      if (best && best.id) {
+        // Step 2: Get full artist details (popularity + followers)
+        const artistRes = await axios.get(`https://api.spotify.com/v1/artists/${best.id}`, {
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: 4000,
+        });
+        const full = artistRes.data;
+        const popularity = full.popularity || 0;
+        const followers = full.followers?.total || 0;
+
+        if (popularity > 0) {
           ev.spotify_popularity = popularity;
           ev.spotify_followers = followers;
           cache.set(cacheKey, { popularity, followers });
           if (popularity > 70) ev.marge = Math.round(ev.marge * 1.15);
-          console.log(`[Spotify] ${artist} → ${best.name} (${popularity}/100, ${followers.toLocaleString()} followers)`);
+          console.log(`[Spotify] ${artist} → ${full.name} (${popularity}/100, ${followers.toLocaleString()} followers)`);
         }
       }
     } catch (err) {
@@ -497,11 +503,19 @@ app.get('/api/spotify/test', async (req, res) => {
       timeout: 5000,
     });
     const items = r.data?.artists?.items || [];
+    // Get full details for first result
+    let full = null;
+    if (items[0]?.id) {
+      const ar = await axios.get(`https://api.spotify.com/v1/artists/${items[0].id}`, {
+        headers: { Authorization: `Bearer ${token}` }, timeout: 5000,
+      });
+      full = { name: ar.data.name, popularity: ar.data.popularity, followers: ar.data.followers?.total, genres: ar.data.genres };
+    }
     res.json({
       query: q,
       token_ok: true,
-      results: items.map(a => ({ name: a.name, id: a.id, popularity: a.popularity, followers: a.followers?.total, genres: a.genres })),
-      raw_first: items[0] || null,
+      search_results: items.map(a => ({ name: a.name, id: a.id })),
+      artist_details: full,
     });
   } catch (err) {
     res.json({ error: err.message, status: err.response?.status, data: err.response?.data });
