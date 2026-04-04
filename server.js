@@ -509,7 +509,7 @@ app.get('/api/spotify/test', async (req, res) => {
       const ar = await axios.get(`https://api.spotify.com/v1/artists/${items[0].id}`, {
         headers: { Authorization: `Bearer ${token}` }, timeout: 5000,
       });
-      full = { name: ar.data.name, popularity: ar.data.popularity, followers: ar.data.followers?.total, genres: ar.data.genres };
+      full = ar.data;
     }
     res.json({
       query: q,
