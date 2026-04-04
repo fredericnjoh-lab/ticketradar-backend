@@ -37,8 +37,7 @@ const SEATGEEK_CLIENT_SECRET = process.env.SEATGEEK_CLIENT_SECRET || '';
 const TICKETMASTER_API_KEY   = process.env.TICKETMASTER_API_KEY   || '';
 const ANTHROPIC_API_KEY      = process.env.ANTHROPIC_API_KEY      || '';
 
-const SPOTIFY_CLIENT_ID     = (process.env.SPOTIFY_CLIENT_ID     || '').trim();
-const SPOTIFY_CLIENT_SECRET = (process.env.SPOTIFY_CLIENT_SECRET || '').trim();
+const LASTFM_API_KEY = (process.env.LASTFM_API_KEY || '').trim();
 
 const STRIPE_SECRET_KEY     = (process.env.STRIPE_SECRET_KEY     || '').trim();
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
@@ -49,7 +48,7 @@ if (!SEATGEEK_CLIENT_ID)   console.warn('⚠ SEATGEEK_CLIENT_ID manquant — /ap
 if (!TICKETMASTER_API_KEY) console.warn('⚠ TICKETMASTER_API_KEY manquant — /api/scan limité');
 if (!ANTHROPIC_API_KEY)    console.warn('⚠ ANTHROPIC_API_KEY manquant — /api/ai désactivé');
 if (!STRIPE_SECRET_KEY)    console.warn('⚠ STRIPE_SECRET_KEY manquant — paiements désactivés');
-if (!SPOTIFY_CLIENT_ID)    console.warn('⚠ SPOTIFY_CLIENT_ID manquant — enrichissement Spotify désactivé');
+if (!LASTFM_API_KEY)       console.warn('⚠ LASTFM_API_KEY manquant — enrichissement Last.fm désactivé');
 
 /* ── Middlewares ── */
 app.use(cors({
@@ -180,7 +179,7 @@ app.get('/api/health', (req, res) => {
     seatgeek:    SEATGEEK_CLIENT_ID   ? 'configured' : 'missing',
     ticketmaster: TICKETMASTER_API_KEY ? 'configured' : 'missing',
     anthropic:   ANTHROPIC_API_KEY    ? 'configured' : 'missing',
-    spotify:     SPOTIFY_CLIENT_ID   ? 'configured' : 'missing',
+    lastfm:      LASTFM_API_KEY      ? 'configured' : 'missing',
     stripe:      STRIPE_SECRET_KEY   ? 'configured' : 'missing',
     sheet:       SHEET_URL            ? 'configured' : 'missing',
     chat_id:     TELEGRAM_CHAT_ID     ? 'configured' : 'missing',
@@ -377,47 +376,18 @@ function dedupeEvents(events) {
 }
 
 /* ══════════════════════════════════════════════
-   SPOTIFY — Artist popularity enrichment
+   LAST.FM — Artist popularity enrichment
 ══════════════════════════════════════════════ */
-
-let _spotifyToken = null;
-let _spotifyTokenExpiry = 0;
-
-async function getSpotifyToken() {
-  if (_spotifyToken && Date.now() < _spotifyTokenExpiry) return _spotifyToken;
-  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) return null;
-
-  try {
-    const res = await axios.post('https://accounts.spotify.com/api/token',
-      'grant_type=client_credentials',
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: 'Basic ' + Buffer.from(SPOTIFY_CLIENT_ID + ':' + SPOTIFY_CLIENT_SECRET).toString('base64'),
-        },
-        timeout: 5000,
-      }
-    );
-    _spotifyToken = res.data.access_token;
-    _spotifyTokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
-    return _spotifyToken;
-  } catch (err) {
-    console.error('[Spotify] Token error:', err.message);
-    return null;
-  }
-}
 
 /**
  * Extract artist name from event name
  * "Ariana Grande Eternal Sunshine Tour" → "Ariana Grande"
- * "Beyoncé Renaissance World Tour" → "Beyoncé"
  * "Champions League Final" → null (sport, skip)
  */
 function extractArtist(name) {
   if (!name) return null;
-  // Strip common tour/event suffixes
   let artist = name
-    .replace(/\s*(tour|tournée|world tour|european tour|concert|live|show|festival|eternal sunshine|short n sweet|renaissance|the eras|cowboy carter)\b.*$/i, '')
+    .replace(/\s*(tour|tournée|world tour|european tour|concert|live|show|festival|eternal sunshine|short n sweet|renaissance|the eras|cowboy carter|grand national|mana)\b.*$/i, '')
     .replace(/\s*(at|@|vs\.?)\s.*$/i, '')
     .replace(/\s*[-–—|]\s.*$/, '')
     .replace(/\s*\d{4}.*$/, '')
@@ -426,17 +396,28 @@ function extractArtist(name) {
   return artist.length >= 2 ? artist : null;
 }
 
-async function enrichWithSpotify(events) {
-  const token = await getSpotifyToken();
-  if (!token) return events;
+/**
+ * Convert Last.fm listeners count to a 0-100 popularity score
+ * 50M+ = 95, 10M+ = 85, 1M+ = 70, 500k+ = 55, 100k+ = 40, <100k = 20
+ */
+function listenersToScore(listeners) {
+  if (listeners >= 50000000) return 95;
+  if (listeners >= 10000000) return 85;
+  if (listeners >= 5000000)  return 78;
+  if (listeners >= 1000000)  return 70;
+  if (listeners >= 500000)   return 55;
+  if (listeners >= 100000)   return 40;
+  if (listeners >= 10000)    return 25;
+  return 10;
+}
 
-  // Only enrich concerts, not sport events
-  const concertCats = ['concert', 'music', 'arts'];
+async function enrichWithLastfm(events) {
+  if (!LASTFM_API_KEY) return events;
+
   const sportCats = ['sport', 'sports', 'mma', 'f1'];
   const cache = new Map();
 
   for (const ev of events) {
-    // Skip sport events — Spotify is irrelevant
     if (sportCats.includes((ev.cat || '').toLowerCase())) continue;
 
     const artist = extractArtist(ev.name);
@@ -446,43 +427,38 @@ async function enrichWithSpotify(events) {
     if (cache.has(cacheKey)) {
       const cached = cache.get(cacheKey);
       ev.spotify_popularity = cached.popularity;
-      ev.spotify_followers = cached.followers;
+      ev.spotify_followers = cached.listeners;
       if (cached.popularity > 70) ev.marge = Math.round(ev.marge * 1.15);
       continue;
     }
 
     try {
-      // Step 1: Search for artist
-      const searchRes = await axios.get('https://api.spotify.com/v1/search', {
-        params: { q: artist, type: 'artist', limit: 3 },
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await axios.get('https://ws.audioscrobbler.com/2.0/', {
+        params: {
+          method: 'artist.getinfo',
+          artist: artist,
+          api_key: LASTFM_API_KEY,
+          format: 'json',
+        },
         timeout: 4000,
       });
-      const items = searchRes.data?.artists?.items || [];
-      const exact = items.find(a => a.name.toLowerCase() === artist.toLowerCase());
-      const best = exact || items[0];
 
-      if (best && best.id) {
-        // Step 2: Get full artist details (popularity + followers)
-        const artistRes = await axios.get(`https://api.spotify.com/v1/artists/${best.id}`, {
-          headers: { Authorization: `Bearer ${token}` },
-          timeout: 4000,
-        });
-        const full = artistRes.data;
-        const popularity = full.popularity || 0;
-        const followers = full.followers?.total || 0;
+      const a = res.data?.artist;
+      if (a && a.stats) {
+        const listeners = parseInt(a.stats.listeners) || 0;
+        const playcount = parseInt(a.stats.playcount) || 0;
+        const popularity = listenersToScore(listeners);
 
-        if (popularity > 0) {
-          ev.spotify_popularity = popularity;
-          ev.spotify_followers = followers;
-          cache.set(cacheKey, { popularity, followers });
-          if (popularity > 70) ev.marge = Math.round(ev.marge * 1.15);
-          console.log(`[Spotify] ${artist} → ${full.name} (${popularity}/100, ${followers.toLocaleString()} followers)`);
-        }
+        ev.spotify_popularity = popularity;
+        ev.spotify_followers = listeners;
+        cache.set(cacheKey, { popularity, listeners });
+
+        if (popularity > 70) ev.marge = Math.round(ev.marge * 1.15);
+        console.log(`[Last.fm] ${artist} → ${a.name} (${popularity}/100, ${listeners.toLocaleString()} listeners)`);
       }
     } catch (err) {
       if (err.response?.status === 429) {
-        console.warn('[Spotify] Rate limited, stopping enrichment');
+        console.warn('[Last.fm] Rate limited, stopping enrichment');
         break;
       }
     }
@@ -491,34 +467,28 @@ async function enrichWithSpotify(events) {
   return events;
 }
 
-/* ── GET /api/spotify/test ── Debug Spotify search ── */
-app.get('/api/spotify/test', async (req, res) => {
+/* ── GET /api/lastfm/test ── Debug Last.fm search ── */
+app.get('/api/lastfm/test', async (req, res) => {
   const q = req.query.q || 'Ariana Grande';
-  const token = await getSpotifyToken();
-  if (!token) return res.json({ error: 'No Spotify token', client_id: SPOTIFY_CLIENT_ID ? 'set' : 'missing' });
+  if (!LASTFM_API_KEY) return res.json({ error: 'LASTFM_API_KEY manquant' });
   try {
-    const r = await axios.get('https://api.spotify.com/v1/search', {
-      params: { q, type: 'artist', limit: 3 },
-      headers: { Authorization: `Bearer ${token}` },
+    const r = await axios.get('https://ws.audioscrobbler.com/2.0/', {
+      params: { method: 'artist.getinfo', artist: q, api_key: LASTFM_API_KEY, format: 'json' },
       timeout: 5000,
     });
-    const items = r.data?.artists?.items || [];
-    // Get full details for first result
-    let full = null;
-    if (items[0]?.id) {
-      const ar = await axios.get(`https://api.spotify.com/v1/artists/${items[0].id}`, {
-        headers: { Authorization: `Bearer ${token}` }, timeout: 5000,
-      });
-      full = ar.data;
-    }
+    const a = r.data?.artist;
+    if (!a) return res.json({ query: q, error: 'Artist not found' });
+    const listeners = parseInt(a.stats?.listeners) || 0;
     res.json({
       query: q,
-      token_ok: true,
-      search_results: items.map(a => ({ name: a.name, id: a.id })),
-      artist_details: full,
+      name: a.name,
+      listeners,
+      playcount: parseInt(a.stats?.playcount) || 0,
+      popularity_score: listenersToScore(listeners),
+      tags: (a.tags?.tag || []).map(t => t.name),
     });
   } catch (err) {
-    res.json({ error: err.message, status: err.response?.status, data: err.response?.data });
+    res.json({ error: err.message, status: err.response?.status });
   }
 });
 
@@ -556,8 +526,8 @@ app.get('/api/scan', async (req, res) => {
       .sort((a, b) => b.marge - a.marge)
       .slice(0, maxLimit);
 
-    // Enrich with Spotify artist popularity
-    all = await enrichWithSpotify(all);
+    // Enrich with Last.fm artist popularity
+    all = await enrichWithLastfm(all);
     // Re-sort after Spotify boost
     all.sort((a, b) => b.marge - a.marge);
 
