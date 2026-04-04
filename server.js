@@ -485,6 +485,28 @@ async function enrichWithSpotify(events) {
   return events;
 }
 
+/* ── GET /api/spotify/test ── Debug Spotify search ── */
+app.get('/api/spotify/test', async (req, res) => {
+  const q = req.query.q || 'Ariana Grande';
+  const token = await getSpotifyToken();
+  if (!token) return res.json({ error: 'No Spotify token', client_id: SPOTIFY_CLIENT_ID ? 'set' : 'missing' });
+  try {
+    const r = await axios.get('https://api.spotify.com/v1/search', {
+      params: { q, type: 'artist', limit: 3 },
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 5000,
+    });
+    const items = r.data?.artists?.items || [];
+    res.json({
+      query: q,
+      token_ok: true,
+      results: items.map(a => ({ name: a.name, popularity: a.popularity, followers: a.followers?.total })),
+    });
+  } catch (err) {
+    res.json({ error: err.message, status: err.response?.status, data: err.response?.data });
+  }
+});
+
 /* ── GET /api/scan ── Main scanner endpoint ── */
 app.get('/api/scan', async (req, res) => {
   const {
